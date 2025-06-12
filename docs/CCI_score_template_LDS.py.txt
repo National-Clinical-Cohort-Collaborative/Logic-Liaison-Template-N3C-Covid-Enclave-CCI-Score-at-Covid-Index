@@ -1,0 +1,76 @@
+#* CCI_score_template_LDS:
+#*   desc: creates person level fact table with CCI score
+#*   ext: py
+#*   inputs:
+#*   - LOGIC_LIAISON_Covid_19_Patient_Summary_Facts_Table_LDS_
+#*   - microvisit_to_macrovisit_lds
+#*   - condition_occurrence
+#* 
+
+def CCI_score_template_LDS(LOGIC_LIAISON_Covid_19_Patient_Summary_Facts_Table_LDS_, microvisit_to_macrovisit_lds, condition_occurrence):
+
+    df = LOGIC_LIAISON_Covid_19_Patient_Summary_Facts_Table_LDS_ \
+            .select('person_id', 'COVID_first_poslab_or_diagnosis_date', *[c for c in LOGIC_LIAISON_Covid_19_Patient_Summary_Facts_Table_LDS_.columns if '_indicator' in c])
+   
+    visit = microvisit_to_macrovisit_lds.select('person_id','visit_start_date') \
+            .where(F.col('visit_start_date').isNotNull()) \
+            .dropDuplicates() \
+            .withColumnRenamed('visit_start_date', 'condition_and_visit_date')
+
+    condition = condition_occurrence.select('person_id','condition_start_date') \
+            .where(F.col('condition_start_date').isNotNull()) \
+            .dropDuplicates() \
+            .withColumnRenamed('condition_start_date', 'condition_and_visit_date')
+
+    #join visit and condition dates to df
+    visit_and_condition = visit.join(condition, ['person_id', 'condition_and_visit_date'], 'outer') \
+            .join(df.select('person_id', 'COVID_first_poslab_or_diagnosis_date'), 'person_id', 'right')
+
+    #add visit_or_cond_before_COVID column, if dif_relative_to_COVID_diagnosis is negative, earliest condition/visit date is before COVID poslab/ diagnosis and a 1 is assigned 
+    visit_or_condition_before = visit_and_condition \
+        .withColumn('dif_relative_to_COVID_diagnosis',   
+            F.when(F.datediff('condition_and_visit_date','COVID_first_poslab_or_diagnosis_date') <= 0, 1).otherwise(0)) \
+        .groupBy('person_id') \
+        .agg(F.max('dif_relative_to_COVID_diagnosis').alias('visit_or_cond_before_COVID'))
+
+    df = df.join(visit_or_condition_before, 'person_id', 'left')
+
+    #calculating CCI components BEFORE and up to covid index
+    MI = F.col('MYOCARDIALINFARCTION_before_or_day_of_covid_indicator') * 1
+    CHF = F.col('CONGESTIVEHEARTFAILURE_before_or_day_of_covid_indicator') * 1
+    PVD = F.col('PERIPHERALVASCULARDISEASE_before_or_day_of_covid_indicator') * 1
+    CVD = F.col('CEREBROVASCULARDISEASE_before_or_day_of_covid_indicator') * 1
+    DEM = F.col('DEMENTIA_before_or_day_of_covid_indicator') * 1
+    CPD = F.col('CHRONICLUNGDISEASE_before_or_day_of_covid_indicator') * 1
+    RD = F.col('RHEUMATOLOGICDISEASE_before_or_day_of_covid_indicator') * 1
+    PEP = F.col('PEPTICULCER_before_or_day_of_covid_indicator') * 1
+    LIV = F.when(F.col('MODERATESEVERELIVERDISEASE_before_or_day_of_covid_indicator')==1, F.col('MODERATESEVERELIVERDISEASE_before_or_day_of_covid_indicator') * 3) \
+            .when(F.col('MODERATESEVERELIVERDISEASE_before_or_day_of_covid_indicator')==0, F.col('MILDLIVERDISEASE_before_or_day_of_covid_indicator') * 1) \
+            .otherwise(0)
+    DIA = F.when(F.col('DIABETESCOMPLICATED_before_or_day_of_covid_indicator')==1, F.col('DIABETESCOMPLICATED_before_or_day_of_covid_indicator') * 2) \
+            .when(F.col('DIABETESCOMPLICATED_before_or_day_of_covid_indicator')==0, F.col('DIABETESUNCOMPLICATED_before_or_day_of_covid_indicator') * 1) \
+            .otherwise(0)
+    HEM = F.col('HEMIPLEGIAORPARAPLEGIA_before_or_day_of_covid_indicator') * 2
+    REN = F.col('KIDNEYDISEASE_before_or_day_of_covid_indicator') * 2
+    #MALIGNANT CANCER concept set covers Leukemia and Lymphoma specified in the Charlson Comorbidity Index calculation
+    CAN = F.when(F.col('METASTATICSOLIDTUMORCANCERS_before_or_day_of_covid_indicator')==1, F.col('METASTATICSOLIDTUMORCANCERS_before_or_day_of_covid_indicator') * 6) \
+            .when(F.col('METASTATICSOLIDTUMORCANCERS_before_or_day_of_covid_indicator')==0, F.col('MALIGNANTCANCER_before_or_day_of_covid_indicator') * 2) \
+            .otherwise(0)
+    HIV = F.col('HIVINFECTION_before_or_day_of_covid_indicator') * 6
+
+    #calculate CCI score, if no conditions exist before COVID diagnosis assign null value, otherwise calculate score for patients
+    #age not included as it is not explicitly included in the reference calculation used and is often already accounted for as a covariate in most studies
+    df = df.withColumn('CCI_score_up_through_index_date', 
+            F.when(F.col('visit_or_cond_before_COVID') == 0, None)
+            .otherwise(F.lit(MI + CHF + PVD + CVD + DEM + CPD + RD + PEP + LIV + DIA + HEM + REN + CAN + HIV).cast(IntegerType()))
+        ) \
+        .select('person_id', 'CCI_score_up_through_index_date')
+
+    return df
+
+#################################################
+## Global imports and functions included below ##
+#################################################
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import IntegerType
